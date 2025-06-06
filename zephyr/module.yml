@@ -41,7 +41,7 @@ blobs:
     description: "Ethernet FW"
     doc-url: https://tenstorrent.com
   - path: tt_blackhole_erisc_params.bin
-    sha256: 8226fadf8e33c4dc31e5fe2e3b2106a54c8507300772cb1c029df59f13728d49
+    sha256: a98db9d5d3dc9d5657b69e69cc6a3ac12f62efaafc707e8f02507c4bc68432b6
     type: img
     version: '1.4.0'
     license-path: zephyr/blobs/license.txt
