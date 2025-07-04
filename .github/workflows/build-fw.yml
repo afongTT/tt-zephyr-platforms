@@ -13,6 +13,7 @@ on:
     branches:
       - main
       - v*-branch
+      - test-fw-disable-gddr-telem
   pull_request:
     types:
       - opened
