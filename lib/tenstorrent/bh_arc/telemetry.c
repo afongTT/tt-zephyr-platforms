@@ -142,77 +142,6 @@ float ConvertTelemetryToFloat(int32_t value)
 	}
 }
 
-static void UpdateGddrTelemetry(void)
-{
-	/* We pack multiple metrics into one field, so need to clear first. */
-	for (int i = 0; i < NUM_GDDR / 2; i++) {
-		telemetry[TAG_GDDR_0_1_TEMP + i] = 0;
-		telemetry[TAG_GDDR_0_1_CORR_ERRS + i] = 0;
-	}
-
-	telemetry[TAG_GDDR_UNCORR_ERRS] = 0;
-	telemetry[TAG_GDDR_STATUS] = 0;
-
-	for (int i = 0; i < NUM_GDDR; i++) {
-		gddr_telemetry_table_t gddr_telemetry;
-		/* Harvested instances should read 0b00 for status. */
-		if (IS_BIT_SET(tile_enable.gddr_enabled, i)) {
-			if (read_gddr_telemetry_table(i, &gddr_telemetry) < 0) {
-				LOG_WRN_ONCE("Failed to read GDDR telemetry table while "
-					     "updating telemetry");
-				continue;
-			}
-			/* DDR Status:
-			 * [0] - Training complete GDDR 0
-			 * [1] - Error GDDR 0
-			 * [2] - Training complete GDDR 1
-			 * [3] - Error GDDR 1
-			 * ...
-			 * [14] - Training Complete GDDR 7
-			 * [15] - Error GDDR 7
-			 */
-			telemetry[TAG_GDDR_STATUS] |=
-						  (gddr_telemetry.training_complete << (i * 2)) |
-						  (gddr_telemetry.gddr_error << (i * 2 + 1));
-
-			/* DDR_x_y_TEMP:
-			 * [31:24] GDDR y top
-			 * [23:16] GDDR y bottom
-			 * [15:8]  GDDR x top
-			 * [7:0]   GDDR x bottom
-			 */
-			int shift_val = (i % 2) * 16;
-
-			telemetry[TAG_GDDR_0_1_TEMP + i / 2] |=
-				((gddr_telemetry.dram_temperature_top & 0xff) << (8 + shift_val)) |
-				((gddr_telemetry.dram_temperature_bottom & 0xff) << shift_val);
-
-			/* GDDR_x_y_CORR_ERRS:
-			 * [31:24] GDDR y Corrected Write EDC errors
-			 * [23:16] GDDR y Corrected Read EDC Errors
-			 * [15:8]  GDDR x Corrected Write EDC errors
-			 * [7:0]   GDDR y Corrected Read EDC Errors
-			 */
-			telemetry[TAG_GDDR_0_1_CORR_ERRS + i / 2] |=
-				((gddr_telemetry.corr_edc_wr_errors & 0xff) << (8 + shift_val)) |
-				((gddr_telemetry.corr_edc_rd_errors & 0xff) << shift_val);
-
-			/* GDDR_UNCORR_ERRS:
-			 * [0]  GDDR 0 Uncorrected Read EDC error
-			 * [1]  GDDR 0 Uncorrected Write EDC error
-			 * [2]  GDDR 1 Uncorrected Read EDC error
-			 * ...
-			 * [15] GDDR 7 Uncorrected Write EDC error
-			 */
-			telemetry[TAG_GDDR_UNCORR_ERRS] |=
-				(gddr_telemetry.uncorr_edc_rd_error << (i * 2)) |
-				(gddr_telemetry.uncorr_edc_wr_error << (i * 2 + 1));
-			/* GDDR speed - in Mbps */
-			telemetry[TAG_GDDR_SPEED] = gddr_telemetry.dram_speed;
-		}
-	}
-}
-
 int GetMaxGDDRTemp(void)
 {
 	int max_gddr_temp = 0;
@@ -331,7 +260,7 @@ static void update_telemetry(void)
 			     */
 	telemetry[TAG_FAN_SPEED] = GetFanSpeed(); /* Target fan speed - reported in percentage */
 	telemetry[TAG_FAN_RPM] = GetFanRPM();     /* Actual fan RPM */
-	UpdateGddrTelemetry();
+	/* UpdateGddrTelemetry(); */
 	telemetry[TAG_MAX_GDDR_TEMP] = GetMaxGDDRTemp();
 	telemetry[TAG_INPUT_POWER] = GetInputPower(); /* Input power - reported in W */
 	telemetry[TAG_TIMER_HEARTBEAT]++; /* Incremented every time the timer is called */
