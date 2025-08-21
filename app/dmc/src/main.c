@@ -743,18 +743,55 @@ int main(void)
 			GPIO_DT_SPEC_GET(DT_CHILD(DT_NODELABEL(chip0), dft_tap_sel), gpios);
 		const struct gpio_dt_spec dft_test_mode =
 			GPIO_DT_SPEC_GET(DT_CHILD(DT_NODELABEL(chip0), dft_test_mode), gpios);
+		const struct device *gpio_x0 = DEVICE_DT_GET(DT_NODELABEL(chip0_strapping0));
+		const struct device *gpio_x1 = DEVICE_DT_GET(DT_NODELABEL(chip0_strapping1));
+		/* Set GPIOs 1, 8, 13, 14, 32, 35 */
+		/* GPIO 1 = gpio_x0 pin 1 */
+		/* GPIO 8 = gpio_x0 pin 6 */
+		/* GPIO 13 = gpio_x0 pin 11 */
+		/* GPIO 14 = gpio_x0 pin 12 */
+		/* GPIO 32 = gpio_x1 pin 0 */
+		/* GPIO 35 = gpio_x1 pin 4 */
+		uint32_t gpio_x0_pins = BIT(1) | BIT(6) | BIT(11) | BIT(12);
+		uint32_t gpio_x1_pins = BIT(0) | BIT(4);
 
 		if (test == true) {
-			/*
-			const struct device *gpio_x0 = DEVICE_DT_GET(DT_NODELABEL(chip0_strapping0));
-			const struct device *gpio_x1 = DEVICE_DT_GET(DT_NODELABEL(chip0_strapping1));
-			*/
+			/* directly connected to STM32 */
 			gpio_pin_configure_dt(&dft_tap_sel, GPIO_OUTPUT_ACTIVE);
 			gpio_pin_configure_dt(&dft_test_mode, GPIO_OUTPUT_ACTIVE);
 
 			gpio_pin_set_dt(&dft_tap_sel, 1);
 			gpio_pin_set_dt(&dft_test_mode, 1);
+
+			k_busy_wait(100);
+
+			/* from GPIO expanders */
+			gpio_pin_configure(gpio_x0, 1, GPIO_OUTPUT_ACTIVE);
+			gpio_pin_configure(gpio_x1, 0, GPIO_OUTPUT_ACTIVE);
+			gpio_pin_configure(gpio_x0, 6, GPIO_OUTPUT_ACTIVE);
+			gpio_pin_configure(gpio_x0, 11, GPIO_OUTPUT_ACTIVE);
+			gpio_pin_configure(gpio_x0, 12, GPIO_OUTPUT_ACTIVE);
+			gpio_pin_configure(gpio_x1, 0, GPIO_OUTPUT_ACTIVE);
+			gpio_pin_configure(gpio_x1, 4, GPIO_OUTPUT_ACTIVE);
+
+			gpio_port_set_bits(gpio_x0, gpio_x0_pins);
+			gpio_port_set_bits(gpio_x1, gpio_x1_pins);
 		} else {
+			/* from GPIO expanders */
+			gpio_port_clear_bits(gpio_x0, gpio_x0_pins);
+			gpio_port_clear_bits(gpio_x1, gpio_x1_pins);
+
+			gpio_pin_configure(gpio_x0, 1, GPIO_OUTPUT_INACTIVE);
+			gpio_pin_configure(gpio_x1, 0, GPIO_OUTPUT_INACTIVE);
+			gpio_pin_configure(gpio_x0, 6, GPIO_OUTPUT_INACTIVE);
+			gpio_pin_configure(gpio_x0, 11, GPIO_OUTPUT_INACTIVE);
+			gpio_pin_configure(gpio_x0, 12, GPIO_OUTPUT_INACTIVE);
+			gpio_pin_configure(gpio_x1, 0, GPIO_OUTPUT_INACTIVE);
+			gpio_pin_configure(gpio_x1, 4, GPIO_OUTPUT_INACTIVE);
+
+			/* directly connected to STM32 */
+			gpio_pin_set_dt(&dft_tap_sel, 0);
+			gpio_pin_set_dt(&dft_test_mode, 0);
 			gpio_pin_configure_dt(&dft_tap_sel, GPIO_OUTPUT_INACTIVE);
 			gpio_pin_configure_dt(&dft_test_mode, GPIO_OUTPUT_INACTIVE);
 		}
