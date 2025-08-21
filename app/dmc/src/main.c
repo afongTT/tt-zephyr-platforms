@@ -46,6 +46,8 @@ struct bh_chip BH_CHIPS[BH_CHIP_COUNT] = {DT_FOREACH_PROP_ELEM(DT_PATH(chips), c
 #error "Primary chip out of range"
 #endif
 
+static volatile bool test;
+
 static const struct gpio_dt_spec board_fault_led =
 	GPIO_DT_SPEC_GET_OR(DT_PATH(board_fault_led), gpios, {0});
 static const struct device *const ina228 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina228));
@@ -735,6 +737,26 @@ int main(void)
 
 		if (events & (TT_EVENT_LOGS_TO_SMC | TT_EVENT_WAKE)) {
 			send_logs_to_smc();
+		}
+
+		const struct gpio_dt_spec dft_tap_sel =
+			GPIO_DT_SPEC_GET(DT_CHILD(DT_NODELABEL(chip0), dft_tap_sel), gpios);
+		const struct gpio_dt_spec dft_test_mode =
+			GPIO_DT_SPEC_GET(DT_CHILD(DT_NODELABEL(chip0), dft_test_mode), gpios);
+
+		if (test == true) {
+			/*
+			const struct device *gpio_x0 = DEVICE_DT_GET(DT_NODELABEL(chip0_strapping0));
+			const struct device *gpio_x1 = DEVICE_DT_GET(DT_NODELABEL(chip0_strapping1));
+			*/
+			gpio_pin_configure_dt(&dft_tap_sel, GPIO_OUTPUT_ACTIVE);
+			gpio_pin_configure_dt(&dft_test_mode, GPIO_OUTPUT_ACTIVE);
+
+			gpio_pin_set_dt(&dft_tap_sel, 1);
+			gpio_pin_set_dt(&dft_test_mode, 1);
+		} else {
+			gpio_pin_configure_dt(&dft_tap_sel, GPIO_OUTPUT_INACTIVE);
+			gpio_pin_configure_dt(&dft_test_mode, GPIO_OUTPUT_INACTIVE);
 		}
 	}
 
