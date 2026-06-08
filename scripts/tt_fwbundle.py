@@ -14,6 +14,7 @@ import hashlib
 from intelhex import IntelHex
 from base64 import b16encode
 from pathlib import Path
+from typing import Optional
 import os
 import sys
 import shutil
@@ -76,6 +77,28 @@ def bundle_metadata(bundle: Path, board: str = "") -> dict:
         print(f"Firmware bundle file not found: {bundle}")
         sys.exit(os.EX_NOINPUT)
     return data
+
+
+def extract_bundle_image_binary(bundle: Path, board: str) -> bytes:
+    """
+    Extract and expand the full board image from a firmware bundle.
+    """
+    try:
+        with (
+            tarfile.open(bundle, "r:gz") as tar,
+            tempfile.TemporaryDirectory() as tempdir,
+        ):
+            image_path = f"./{board}/image.bin"
+            tar.extract(image_path, path=tempdir, filter="data")
+            return tt_boot_fs.load_bootfs_binary(
+                Path(tempdir) / image_path, input_base64=True
+            )
+    except KeyError as e:
+        print(f"Firmware bundle missing expected file: {e}")
+        sys.exit(os.EX_DATAERR)
+    except FileNotFoundError:
+        print(f"Firmware bundle file not found: {bundle}")
+        sys.exit(os.EX_NOINPUT)
 
 
 def extract_bundle_binary(bundle: Path, board: str, tag: str, output: Path):
@@ -334,6 +357,104 @@ def invoke_extract_fw_bundle(args):
     return ret
 
 
+def compare_flash_to_bundle(
+    flash: Path,
+    bundle: Path,
+    board: str,
+    *,
+    report: Optional[Path] = None,
+    csv: Optional[Path] = None,
+    diff_offsets_dir: Optional[Path] = None,
+    output_json: bool = False,
+) -> int:
+    """
+    Compare a local flash dump against a board image inside a firmware bundle.
+    """
+    if not flash.exists():
+        print(f"Flash file not found: {flash}")
+        return os.EX_NOINPUT
+    if not bundle.exists():
+        print(f"Firmware bundle file not found: {bundle}")
+        return os.EX_NOINPUT
+
+    actual_data = tt_boot_fs.load_bootfs_binary(flash)
+    expected_data = extract_bundle_image_binary(bundle, board)
+    result = tt_boot_fs.compare_bootfs_images(actual_data, expected_data)
+
+    meta = bundle_metadata(bundle, board)
+    manifest = meta.get("manifest", {})
+    bv = manifest.get("bundle_version", {})
+    bundle_version = (
+        f"{bv.get('fwId', '?')}.{bv.get('releaseId', '?')}."
+        f"{bv.get('patch', '?')}.{bv.get('debug', '?')}"
+        if bv
+        else "unknown"
+    )
+
+    header_lines = [
+        "## Sources",
+        "",
+        "| Item | Path / value |",
+        "|------|----------------|",
+        f"| Flash dump | `{flash}` |",
+        f"| Flash size | `0x{result.actual_size:X}` ({result.actual_size:,} bytes) |",
+        f"| Expected bundle | `{bundle}` → `{board}/image.bin` |",
+        f"| Expected expanded | `0x{result.expected_size:X}` ({result.expected_size:,} bytes) |",
+        f"| Bundle version | {bundle_version} |",
+        f"| Board | {board} |",
+    ]
+
+    if output_json:
+        payload = tt_boot_fs.compare_result_to_json(result)
+        payload["flash"] = str(flash)
+        payload["bundle"] = str(bundle)
+        payload["board"] = board
+        payload["bundle_version"] = bundle_version
+        print(json.dumps(payload, indent=2))
+    else:
+        tt_boot_fs.print_compare_summary(result)
+
+    if report:
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            tt_boot_fs.format_compare_report(
+                result,
+                actual_label=str(flash),
+                expected_label=f"{board} ({bundle})",
+                header_lines=header_lines,
+            ),
+            encoding="utf-8",
+        )
+        if not output_json:
+            print(f"Wrote report to {report}")
+
+    if csv:
+        tt_boot_fs.write_compare_csv(result, csv)
+        if not output_json:
+            print(f"Wrote CSV to {csv}")
+
+    if diff_offsets_dir:
+        tt_boot_fs.write_compare_diff_offsets(
+            result, actual_data, expected_data, diff_offsets_dir
+        )
+        if not output_json:
+            print(f"Wrote diff offsets to {diff_offsets_dir}")
+
+    return os.EX_OK if result.match else os.EX_DATAERR
+
+
+def invoke_compare_flash_to_bundle(args):
+    return compare_flash_to_bundle(
+        args.flash,
+        args.bundle,
+        args.board,
+        report=args.report,
+        csv=args.csv,
+        diff_offsets_dir=args.diff_offsets_dir,
+        output_json=args.json,
+    )
+
+
 def parse_args():
     """
     Parse command line arguments.
@@ -464,6 +585,54 @@ def parse_args():
         help="output file for extracted binary",
         type=Path,
         required=True,
+    )
+    # Compare flash dump to fwbundle board image
+    fw_bundle_compare_parser = subparsers.add_parser(
+        "compare", help="Compare flash dump to fwbundle board image"
+    )
+    fw_bundle_compare_parser.set_defaults(func=invoke_compare_flash_to_bundle)
+    fw_bundle_compare_parser.add_argument(
+        "-b",
+        "--board",
+        metavar="BOARD",
+        help="board prefix (e.g. P150A-1, P300C-1_left)",
+        required=True,
+    )
+    fw_bundle_compare_parser.add_argument(
+        "flash",
+        metavar="FLASH",
+        help="local SPI flash dump (.bin or .hex)",
+        type=Path,
+    )
+    fw_bundle_compare_parser.add_argument(
+        "bundle",
+        metavar="BUNDLE",
+        help="firmware bundle to compare against",
+        type=Path,
+    )
+    fw_bundle_compare_parser.add_argument(
+        "--report",
+        metavar="REPORT",
+        help="write markdown comparison report",
+        type=Path,
+    )
+    fw_bundle_compare_parser.add_argument(
+        "--csv",
+        metavar="CSV",
+        help="write per-tag comparison CSV",
+        type=Path,
+    )
+    fw_bundle_compare_parser.add_argument(
+        "--diff-offsets-dir",
+        metavar="DIR",
+        help="write per-tag diff offset lists for non-identical payloads",
+        type=Path,
+    )
+    fw_bundle_compare_parser.add_argument(
+        "-j",
+        "--json",
+        help="output summary in JSON format",
+        action="store_true",
     )
 
     args = parser.parse_args()

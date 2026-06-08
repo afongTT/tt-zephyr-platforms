@@ -517,3 +517,25 @@ def test_tensix_disable(tmp_path: Path):
     assert tt_fwbundle.diff_fw_bundles(input_path, output_path) != os.EX_OK, (
         "diff_fw_bundles should detect changes after Tensix disable count update"
     )
+
+
+def test_compare_bootfs_images_self_match(tmp_path: Path):
+    """
+    compare_bootfs_images reports a match when actual and expected are identical.
+    """
+    data, _ = gen_test_image(tmp_path)
+    result = tt_boot_fs.compare_bootfs_images(data, data)
+    assert result.match, "compare_bootfs_images should match identical images"
+
+
+def test_compare_bootfs_images_corrupt(tmp_path: Path):
+    """
+    compare_bootfs_images detects a single-byte corruption in the actual image.
+    """
+    data, _ = gen_test_image(tmp_path)
+    corrupted = bytearray(data)
+    corrupted[tt_boot_fs.IMAGE_ADDR] ^= 0xFF
+    result = tt_boot_fs.compare_bootfs_images(bytes(corrupted), data)
+    assert not result.match, "compare_bootfs_images should detect corruption"
+    image_a_row = next(row for row in result.payload_rows if row.tag == "imageA")
+    assert image_a_row.diff_bytes > 0, "imageA payload should differ after corruption"

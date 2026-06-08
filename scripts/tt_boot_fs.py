@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import base64
+import csv
 import ctypes
+from collections import Counter
 from dataclasses import dataclass
 import io
 import logging
@@ -14,7 +16,7 @@ import os
 from pathlib import Path
 import pykwalify.core
 import struct
-from typing import Any, Callable, cast, Iterable, Optional, Tuple
+from typing import Any, Callable, cast, Iterable, Optional, Tuple, Union
 import yaml
 import argparse
 import sys
@@ -740,6 +742,580 @@ def cksum(data: bytes):
     return calculated_checksum
 
 
+def load_bootfs_binary(source: Union[Path, bytes], input_base64: bool = False) -> bytes:
+    """
+    Load tt-boot-fs image bytes from a file path or return bytes unchanged.
+    Supports raw binary, Intel HEX, and tt-flash base64 @offset sparse format.
+    """
+    if isinstance(source, bytes):
+        return source
+
+    if input_base64:
+        data = bytes()
+        with open(source, "r", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("@"):
+                    offset = int(line[1:], 10)
+                    data += bytes([0xFF] * (offset - len(data)))
+                else:
+                    line = line.strip()
+                    if line:
+                        data += base64.b16decode(line)
+        return data
+
+    if source.suffix == ".hex":
+        ih = IntelHex(str(source))
+        return ih.tobinarray()
+
+    with open(source, "rb") as f:
+        return f.read()
+
+
+def compute_image_digest(data: bytes) -> str:
+    """Return imgtool SHA digest for signed images, otherwise N/A."""
+    if len(data) < 4:
+        return "N/A"
+    magic = int.from_bytes(data[:4], "little")
+    if magic != imgtool_image.IMAGE_MAGIC:
+        return "N/A"
+    with tempfile.NamedTemporaryFile() as temp_file:
+        temp_file.write(data)
+        temp_file.flush()
+        ret, _, digest, _ = imgtool_image.Image.verify(temp_file.name, None)
+        if ret == imgtool_image.VerifyResult.OK:
+            return digest.hex()
+    return "N/A"
+
+
+def fd_crc_valid(fd: tt_boot_fs_fd) -> bool:
+    raw = bytes(fd)
+    return cksum(raw[: -ctypes.sizeof(ctypes.c_uint32)]) == fd.fd_crc
+
+
+def parse_fd_table(
+    data: bytes,
+) -> tuple[list[tuple[int, tt_boot_fs_fd]], list[tuple[int, tt_boot_fs_fd]]]:
+    """
+    Parse primary and failover FD tables from a bootfs binary.
+    Returns (primary_fds, failover_fds).
+    """
+
+    def reader(addr: int, size: int) -> bytes:
+        return data[addr : addr + size]
+
+    primary: list[tuple[int, tt_boot_fs_fd]] = []
+    for fd_off, fd in iter_fd(reader):
+        primary.append((fd_off, fd))
+
+    failover: list[tuple[int, tt_boot_fs_fd]] = []
+    if len(data) >= FAILOVER_HEAD_ADDR + FD_SIZE:
+        fd = read_fd(reader, FAILOVER_HEAD_ADDR)
+        if fd.flags.f.invalid == 0:
+            failover.append((FAILOVER_HEAD_ADDR, fd))
+
+    return primary, failover
+
+
+def _fd_tag_map(
+    fds: list[tuple[int, tt_boot_fs_fd]],
+) -> dict[str, list[tuple[int, tt_boot_fs_fd]]]:
+    result: dict[str, list[tuple[int, tt_boot_fs_fd]]] = {}
+    for fd_off, fd in fds:
+        tag = fd.image_tag_str()
+        if not tag:
+            continue
+        result.setdefault(tag, []).append((fd_off, fd))
+    return result
+
+
+def _slice_at(data: bytes, addr: int, size: int) -> bytes:
+    end = addr + size
+    if addr >= len(data):
+        return bytes([0xFF] * size)
+    chunk = data[addr:end]
+    if len(chunk) < size:
+        chunk += bytes([0xFF] * (size - len(chunk)))
+    return chunk
+
+
+def _diff_byte_count(a: bytes, b: bytes) -> int:
+    return sum(1 for i in range(min(len(a), len(b))) if a[i] != b[i]) + abs(
+        len(a) - len(b)
+    )
+
+
+def _diff_regions(a: bytes, b: bytes, limit: int = 30) -> list[tuple[int, int]]:
+    regions: list[tuple[int, int]] = []
+    i = 0
+    limit_end = min(len(a), len(b))
+    while i < limit_end:
+        if a[i] == b[i]:
+            i += 1
+            continue
+        start = i
+        while i < limit_end and a[i] != b[i]:
+            i += 1
+        regions.append((start, i - 1))
+        if len(regions) >= limit:
+            break
+    return regions
+
+
+def _all_diff_offsets(a: bytes, b: bytes) -> list[tuple[int, int, int]]:
+    offsets: list[tuple[int, int, int]] = []
+    for i in range(min(len(a), len(b))):
+        if a[i] != b[i]:
+            offsets.append((i, a[i], b[i]))
+    return offsets
+
+
+@dataclass
+class FdCompareRow:
+    tag: str
+    actual_fd_offset: Optional[int]
+    expected_fd_offset: Optional[int]
+    actual_spi_addr: Optional[int]
+    expected_spi_addr: int
+    actual_size: Optional[int]
+    expected_size: int
+    actual_data_crc: Optional[int]
+    expected_data_crc: int
+    fd_metadata_match: bool
+    fd_crc_ok: Optional[bool]
+    notes: str
+
+
+@dataclass
+class PayloadCompareRow:
+    tag: str
+    spi_addr: int
+    size: int
+    diff_bytes: int
+    diff_percent: float
+    identical: bool
+    actual_crc: int
+    expected_crc: int
+
+
+@dataclass
+class MisplacedFdRow:
+    tag: str
+    actual_spi_addr: int
+    expected_spi_addr: int
+    fd_addr_diff_bytes: int
+    fd_addr_diff_percent: float
+    expected_addr_diff_bytes: int
+    expected_addr_diff_percent: float
+
+
+@dataclass
+class CompareResult:
+    match: bool
+    actual_size: int
+    expected_size: int
+    raw_diff_bytes: int
+    raw_diff_percent: float
+    spi_rx_ok: bool
+    duplicate_actual_tags: list[str]
+    fd_rows: list[FdCompareRow]
+    payload_rows: list[PayloadCompareRow]
+    misplaced_rows: list[MisplacedFdRow]
+    diff_regions: dict[str, list[tuple[int, int]]]
+
+
+def compare_bootfs_images(actual: bytes, expected: bytes) -> CompareResult:
+    """
+    Compare actual flash contents against an expected bootfs image.
+    Layout (spi_addr, sizes) is taken from the expected image.
+    """
+    expected_fs = BootFs.from_binary(expected)
+    actual_primary, actual_failover = parse_fd_table(actual)
+    expected_primary, expected_failover = parse_fd_table(expected)
+
+    actual_fd_by_tag = _fd_tag_map(actual_primary)
+    expected_fd_by_tag = _fd_tag_map(expected_primary)
+    if expected_failover:
+        for tag, entries in _fd_tag_map(expected_failover).items():
+            expected_fd_by_tag.setdefault(tag, []).extend(entries)
+
+    duplicate_actual_tags = [
+        tag
+        for tag, count in Counter(
+            fd.image_tag_str() for _, fd in actual_primary if fd.image_tag_str()
+        ).items()
+        if count > 1
+    ]
+
+    overlap = min(len(actual), len(expected))
+    raw_diff_bytes = _diff_byte_count(actual[:overlap], expected[:overlap])
+    raw_diff_percent = (100.0 * raw_diff_bytes / overlap) if overlap else 0.0
+
+    spi_rx_ok = False
+    if len(actual) >= SPI_RX_ADDR + SPI_RX_SIZE:
+        spi_rx_ok = struct.unpack_from("<I", actual, SPI_RX_ADDR)[0] == SPI_RX_VALUE
+
+    fd_rows: list[FdCompareRow] = []
+    payload_rows: list[PayloadCompareRow] = []
+    misplaced_rows: list[MisplacedFdRow] = []
+    diff_regions: dict[str, list[tuple[int, int]]] = {}
+
+    order: list[tuple[int, str]] = []
+    for tag, entry in expected_fs.entries.items():
+        order.append((entry.spi_addr, tag))
+    order.sort(key=lambda x: x[0])
+    tags = [tag for _, tag in order]
+
+    for tag in tags:
+        entry = expected_fs.entries[tag]
+        exp_fd = entry.get_descriptor()
+        exp_addr = entry.spi_addr
+        exp_size = len(entry.data)
+        exp_data = entry.data
+        exp_crc = cksum(exp_data)
+
+        if tag == "failover":
+            actual_fd_entries = actual_failover
+            exp_fd_entries = expected_failover
+        else:
+            actual_fd_entries = actual_fd_by_tag.get(tag, [])
+            exp_fd_entries = expected_fd_by_tag.get(tag, [])
+
+        actual_fd_off = actual_fd_entries[0][0] if actual_fd_entries else None
+        actual_fd = actual_fd_entries[0][1] if actual_fd_entries else None
+        exp_fd_off = exp_fd_entries[0][0] if exp_fd_entries else None
+
+        actual_spi = actual_fd.spi_addr if actual_fd else None
+        actual_size = actual_fd.flags.f.image_size if actual_fd else None
+        actual_data_crc = actual_fd.data_crc if actual_fd else None
+        fd_crc_ok = fd_crc_valid(actual_fd) if actual_fd else None
+
+        notes: list[str] = []
+        if actual_fd is None:
+            notes.append("missing FD")
+        if len(actual_fd_entries) > 1:
+            notes.append("duplicate FD")
+        if actual_spi is not None and actual_spi != exp_addr:
+            notes.append(f"Δspi=0x{actual_spi - exp_addr:x}")
+        if actual_size is not None and actual_size != exp_size:
+            notes.append(f"size 0x{actual_size:x}≠0x{exp_size:x}")
+        if actual_data_crc is not None and actual_data_crc != exp_fd.data_crc:
+            notes.append("data_crc≠")
+        if fd_crc_ok is False:
+            notes.append("spi_fd_crc_bad")
+
+        fd_metadata_match = (
+            actual_fd is not None
+            and actual_spi == exp_addr
+            and actual_size == exp_size
+            and actual_data_crc == exp_fd.data_crc
+            and fd_crc_ok is not False
+            and len(actual_fd_entries) <= 1
+        )
+
+        fd_rows.append(
+            FdCompareRow(
+                tag=tag,
+                actual_fd_offset=actual_fd_off,
+                expected_fd_offset=exp_fd_off,
+                actual_spi_addr=actual_spi,
+                expected_spi_addr=exp_addr,
+                actual_size=actual_size,
+                expected_size=exp_size,
+                actual_data_crc=actual_data_crc,
+                expected_data_crc=exp_fd.data_crc,
+                fd_metadata_match=fd_metadata_match,
+                fd_crc_ok=fd_crc_ok,
+                notes=", ".join(notes) if notes else "✓ meta",
+            )
+        )
+
+        actual_payload = _slice_at(actual, exp_addr, exp_size)
+        diff_bytes = _diff_byte_count(actual_payload, exp_data)
+        diff_percent = (100.0 * diff_bytes / exp_size) if exp_size else 0.0
+        identical = diff_bytes == 0
+        actual_crc = cksum(actual_payload)
+
+        payload_rows.append(
+            PayloadCompareRow(
+                tag=tag,
+                spi_addr=exp_addr,
+                size=exp_size,
+                diff_bytes=diff_bytes,
+                diff_percent=diff_percent,
+                identical=identical,
+                actual_crc=actual_crc,
+                expected_crc=exp_crc,
+            )
+        )
+
+        if not identical:
+            diff_regions[tag] = _diff_regions(actual_payload, exp_data)
+
+        if actual_spi is not None and actual_spi != exp_addr:
+            fd_slice = _slice_at(actual, actual_spi, exp_size)
+            fd_diff = _diff_byte_count(fd_slice, exp_data)
+            misplaced_rows.append(
+                MisplacedFdRow(
+                    tag=tag,
+                    actual_spi_addr=actual_spi,
+                    expected_spi_addr=exp_addr,
+                    fd_addr_diff_bytes=fd_diff,
+                    fd_addr_diff_percent=(100.0 * fd_diff / exp_size)
+                    if exp_size
+                    else 0.0,
+                    expected_addr_diff_bytes=diff_bytes,
+                    expected_addr_diff_percent=diff_percent,
+                )
+            )
+
+    match = (
+        spi_rx_ok
+        and not duplicate_actual_tags
+        and all(row.identical for row in payload_rows)
+        and all(row.fd_metadata_match for row in fd_rows)
+    )
+
+    return CompareResult(
+        match=match,
+        actual_size=len(actual),
+        expected_size=len(expected),
+        raw_diff_bytes=raw_diff_bytes,
+        raw_diff_percent=raw_diff_percent,
+        spi_rx_ok=spi_rx_ok,
+        duplicate_actual_tags=duplicate_actual_tags,
+        fd_rows=fd_rows,
+        payload_rows=payload_rows,
+        misplaced_rows=misplaced_rows,
+        diff_regions=diff_regions,
+    )
+
+
+def format_compare_report(
+    result: CompareResult,
+    *,
+    actual_label: str = "Flash",
+    expected_label: str = "Expected",
+    header_lines: Optional[list[str]] = None,
+) -> str:
+    lines: list[str] = [
+        f"# {actual_label} vs {expected_label} — comparison report",
+        "",
+    ]
+    if header_lines:
+        lines.extend(header_lines)
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Executive summary",
+            "",
+            f"- **Match:** {'yes' if result.match else 'no'}",
+            f"- **{actual_label} size:** `0x{result.actual_size:X}` ({result.actual_size:,} bytes)",
+            f"- **{expected_label} size:** `0x{result.expected_size:X}` ({result.expected_size:,} bytes)",
+            f"- **Raw overlap diff:** {result.raw_diff_bytes:,} bytes ({result.raw_diff_percent:.2f}%)",
+            f"- **SPI RX @ `0x{SPI_RX_ADDR:X}`:** {'OK' if result.spi_rx_ok else 'MISMATCH'}",
+        ]
+    )
+    if result.duplicate_actual_tags:
+        lines.append(
+            f"- **Duplicate FD tags on flash:** {result.duplicate_actual_tags}"
+        )
+    lines.extend(["", "## FD metadata comparison", ""])
+    lines.append(
+        "| Tag | Actual FD @ | Exp FD @ | Actual spi_addr | Exp spi_addr | "
+        "Size act | Size exp | Notes |"
+    )
+    lines.append(
+        "|-----|-----------|----------|-----------------|--------------|"
+        "----------|----------|-------|"
+    )
+    for row in result.fd_rows:
+        act_off = (
+            f"`0x{row.actual_fd_offset:X}`" if row.actual_fd_offset is not None else "—"
+        )
+        exp_off = (
+            f"`0x{row.expected_fd_offset:X}`"
+            if row.expected_fd_offset is not None
+            else "—"
+        )
+        act_spi = (
+            f"`0x{row.actual_spi_addr:X}`" if row.actual_spi_addr is not None else "—"
+        )
+        act_size = f"`0x{row.actual_size:X}`" if row.actual_size is not None else "—"
+        lines.append(
+            f"| {row.tag} | {act_off} | {exp_off} | {act_spi} | "
+            f"`0x{row.expected_spi_addr:X}` | {act_size} | "
+            f"`0x{row.expected_size:X}` | {row.notes} |"
+        )
+
+    lines.extend(["", "## Payload at expected SPI addresses", ""])
+    lines.append(
+        "| Tag | SPI addr | Size | Diff bytes | Diff % | Identical | "
+        "Actual CRC | Expected CRC |"
+    )
+    lines.append(
+        "|-----|----------|------|------------|--------|-----------|"
+        "------------|--------------|"
+    )
+    for row in result.payload_rows:
+        lines.append(
+            f"| {row.tag} | `0x{row.spi_addr:X}` | `0x{row.size:X}` | "
+            f"{row.diff_bytes} | {row.diff_percent:.3f} | "
+            f"{'yes' if row.identical else 'no'} | "
+            f"`0x{row.actual_crc:08X}` | `0x{row.expected_crc:08X}` |"
+        )
+
+    if result.misplaced_rows:
+        lines.extend(["", "## Misplaced FD entries", ""])
+        for row in result.misplaced_rows:
+            lines.extend(
+                [
+                    f"### {row.tag}",
+                    "",
+                    f"- FD `spi_addr`: `0x{row.actual_spi_addr:X}` "
+                    f"(expected `0x{row.expected_spi_addr:X}`)",
+                    f"- Bytes at FD address vs expected: {row.fd_addr_diff_bytes} differ "
+                    f"({row.fd_addr_diff_percent:.1f}%)",
+                    f"- Bytes at expected address vs expected: "
+                    f"{row.expected_addr_diff_bytes} differ "
+                    f"({row.expected_addr_diff_percent:.1f}%)",
+                    "",
+                ]
+            )
+
+    non_identical = [row for row in result.payload_rows if not row.identical]
+    if non_identical:
+        lines.extend(["", "## Per-image detail (non-identical payloads)", ""])
+        for row in non_identical:
+            regions = result.diff_regions.get(row.tag, [])
+            lines.extend(
+                [
+                    f"### {row.tag} @ `0x{row.spi_addr:X}` (`0x{row.size:X}` bytes)",
+                    "",
+                    f"- Differing bytes: **{row.diff_bytes}** / {row.size} "
+                    f"({row.diff_percent:.3f}%)",
+                    f"- Actual CRC: `0x{row.actual_crc:08X}`",
+                    f"- Expected CRC: `0x{row.expected_crc:08X}`",
+                ]
+            )
+            if regions:
+                lines.append("- Diff regions (image-relative, up to 30):")
+                for start, end in regions:
+                    lines.append(f"  - `+0x{start:X}`–`+0x{end:X}`")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def write_compare_csv(result: CompareResult, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "tag",
+                "compare_at",
+                "spi_addr",
+                "size",
+                "diff_bytes",
+                "diff_percent",
+                "identical",
+                "actual_checksum_ok",
+                "expected_checksum_ok",
+                "actual_crc",
+                "expected_crc",
+            ]
+        )
+        for row in result.payload_rows:
+            writer.writerow(
+                [
+                    row.tag,
+                    "expected_spi_addr",
+                    f"0x{row.spi_addr:x}",
+                    row.size,
+                    row.diff_bytes,
+                    round(row.diff_percent, 4),
+                    row.identical,
+                    row.identical,
+                    True,
+                    f"0x{row.actual_crc:08X}",
+                    f"0x{row.expected_crc:08X}",
+                ]
+            )
+
+
+def write_compare_diff_offsets(
+    result: CompareResult,
+    actual: bytes,
+    expected: bytes,
+    directory: Path,
+) -> None:
+    expected_fs = BootFs.from_binary(expected)
+    directory.mkdir(parents=True, exist_ok=True)
+    for tag in result.diff_regions:
+        entry = expected_fs.entries[tag]
+        actual_payload = _slice_at(actual, entry.spi_addr, len(entry.data))
+        offsets = _all_diff_offsets(actual_payload, entry.data)
+        out_path = directory / f"{tag}_diff_offsets.txt"
+        with open(out_path, "w", encoding="utf-8") as f:
+            for off, actual_byte, expected_byte in offsets:
+                f.write(f"+0x{off:X}: 0x{actual_byte:02X} -> 0x{expected_byte:02X}\n")
+
+
+def compare_result_to_json(result: CompareResult) -> dict:
+    return {
+        "match": result.match,
+        "actual_size": result.actual_size,
+        "expected_size": result.expected_size,
+        "raw_diff_bytes": result.raw_diff_bytes,
+        "raw_diff_percent": result.raw_diff_percent,
+        "spi_rx_ok": result.spi_rx_ok,
+        "duplicate_actual_tags": result.duplicate_actual_tags,
+        "payload_rows": [
+            {
+                "tag": row.tag,
+                "spi_addr": row.spi_addr,
+                "size": row.size,
+                "diff_bytes": row.diff_bytes,
+                "diff_percent": row.diff_percent,
+                "identical": row.identical,
+                "actual_crc": f"0x{row.actual_crc:08X}",
+                "expected_crc": f"0x{row.expected_crc:08X}",
+            }
+            for row in result.payload_rows
+        ],
+        "fd_rows": [
+            {
+                "tag": row.tag,
+                "fd_metadata_match": row.fd_metadata_match,
+                "notes": row.notes,
+            }
+            for row in result.fd_rows
+        ],
+    }
+
+
+def print_compare_summary(result: CompareResult) -> None:
+    print(f"Match: {'yes' if result.match else 'no'}")
+    print(
+        f"Flash size: 0x{result.actual_size:X}  "
+        f"Expected size: 0x{result.expected_size:X}"
+    )
+    print(
+        f"Raw overlap diff: {result.raw_diff_bytes} bytes "
+        f"({result.raw_diff_percent:.2f}%)"
+    )
+    print(f"SPI RX @ 0x{SPI_RX_ADDR:X}: {'OK' if result.spi_rx_ok else 'MISMATCH'}")
+    if result.duplicate_actual_tags:
+        print(f"Duplicate FD tags: {result.duplicate_actual_tags}")
+    mismatched = [row.tag for row in result.payload_rows if not row.identical]
+    if mismatched:
+        print(f"Non-identical payloads at expected addresses: {', '.join(mismatched)}")
+    fd_mismatch = [row.tag for row in result.fd_rows if not row.fd_metadata_match]
+    if fd_mismatch:
+        print(f"FD metadata mismatches: {', '.join(fd_mismatch)}")
+
+
 def mkfs(path: Path, env={"$ROOT": str(ROOT)}, hex=False, all_sections=False) -> bytes:
     fi = None
     try:
@@ -756,12 +1332,7 @@ def mkfs(path: Path, env={"$ROOT": str(ROOT)}, hex=False, all_sections=False) ->
 def fsck(path: Path, alignment: int = 0x1000) -> bool:
     fs = None
     try:
-        if path.suffix == ".hex":
-            # Read hex file and convert to binary
-            ih = IntelHex(str(path))
-            data = ih.tobinarray()
-        else:
-            data = open(path, "rb").read()
+        data = load_bootfs_binary(path)
         fs = BootFs.from_binary(data, alignment=alignment)
     except Exception as e:
         _logger.error(f"Exception: {e}")
@@ -809,25 +1380,7 @@ def ls(
     fds = []
 
     try:
-        if input_base64:
-            data = bytes(0)
-            # Pad with 0x0 between offsets
-            with open(bootfs, "r") as f:
-                lines = f.readlines()
-                for line in lines:
-                    if line.startswith("@"):
-                        # This is an address line, pad data to this point
-                        offset = int(line[1:], 10)
-                        data += bytes([0xFF] * (offset - len(data)))  # Pad with 0x0
-                    else:
-                        # This is a data line, decode and append
-                        data += base64.b16decode(line.strip())
-        elif bootfs.suffix == ".hex":
-            # Read hex file and convert to binary
-            ih = IntelHex(str(bootfs))
-            data = ih.tobinarray()
-        else:
-            data = open(bootfs, "rb").read()
+        data = load_bootfs_binary(bootfs, input_base64=input_base64)
         fs = BootFs.from_binary(data)
 
         if verbose >= 0 and not output_json:
@@ -846,19 +1399,7 @@ def ls(
             entry = fs.entries[tag]
             fd = entry.get_descriptor()
 
-            img_digest_str = "N/A"
-            if len(entry.data) >= 4:
-                magic = int.from_bytes(entry.data[:4], "little")
-                if magic == imgtool_image.IMAGE_MAGIC:
-                    # imgtool methods for verifying image expect a file, so create a temp file
-                    with tempfile.NamedTemporaryFile() as temp_file:
-                        temp_file.write(entry.data)
-                        temp_file.flush()
-                        ret, _, digest, _ = imgtool_image.Image.verify(
-                            temp_file.name, None
-                        )
-                        if ret == imgtool_image.VerifyResult.OK:
-                            img_digest_str = digest.hex()
+            img_digest_str = compute_image_digest(entry.data)
 
             obj = {
                 "spi_addr": fd.spi_addr,
@@ -898,25 +1439,7 @@ def ls(
 
 def extract(bootfs: Path, tag: str, output: Path, input_base64=False):
     try:
-        if input_base64:
-            data = bytes(0)
-            # Pad with 0x0 between offsets
-            with open(bootfs, "r") as f:
-                lines = f.readlines()
-                for line in lines:
-                    if line.startswith("@"):
-                        # This is an address line, pad data to this point
-                        offset = int(line[1:], 10)
-                        data += bytes([0xFF] * (offset - len(data)))  # Pad with 0x0
-                    else:
-                        # This is a data line, decode and append
-                        data += base64.b16decode(line.strip())
-        elif bootfs.suffix == ".hex":
-            # Read hex file and convert to binary
-            ih = IntelHex(str(bootfs))
-            data = ih.tobinarray()
-        else:
-            data = open(bootfs, "rb").read()
+        data = load_bootfs_binary(bootfs, input_base64=input_base64)
         fs = BootFs.from_binary(data)
 
         entry_data = None
@@ -934,28 +1457,7 @@ def extract(bootfs: Path, tag: str, output: Path, input_base64=False):
 
 
 def extract_all(bootfs: Path, input_base64=False):
-    if input_base64:
-        data = bytes(0)
-        # Pad with 0x0 between offsets
-        with open(bootfs, "r") as f:
-            lines = f.readlines()
-            for line in lines:
-                if line.startswith("@"):
-                    # This is an address line, pad data to this point
-                    offset = int(line[1:], 10)
-                    # Pad with 0x0
-                    data += bytes([0xFF] * (offset - len(data)))
-                else:
-                    # This is a data line, decode and append
-                    data += base64.b16decode(line.strip())
-    elif bootfs.suffix == ".hex":
-        # Read hex file and convert to binary
-        ih = IntelHex(str(bootfs))
-        data = ih.tobinarray()
-    else:
-        data = open(bootfs, "rb").read()
-
-    return data
+    return load_bootfs_binary(bootfs, input_base64=input_base64)
 
 
 def _generate_bootfs_yaml(

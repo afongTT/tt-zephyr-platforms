@@ -18,6 +18,7 @@ TEST_ROOT = Path(__file__).parent.resolve()
 MODULE_ROOT = TEST_ROOT.parents[4]
 WORKSPACE_ROOT = MODULE_ROOT.parent
 sys.path.append(str(MODULE_ROOT / "scripts"))
+import tt_boot_fs  # noqa: E402
 import tt_fwbundle  # noqa: E402
 
 logging.basicConfig()
@@ -259,6 +260,72 @@ def workdir() -> Path:
         yield Path(tmpdirname)
 
 
+def _build_minimal_bootfs(image_a: bytes, image_b: bytes) -> bytes:
+    """Assemble a minimal valid tt-boot-fs image."""
+    spi_addr = tt_boot_fs.IMAGE_ADDR
+    fd_a = tt_boot_fs.FsEntry(
+        tag="imageA",
+        data=image_a,
+        load_addr=0x1000000,
+        executable=True,
+        provisioning_only=False,
+        spi_addr=spi_addr,
+    )
+    fd_b = tt_boot_fs.FsEntry(
+        tag="imageB",
+        data=image_b,
+        provisioning_only=False,
+        spi_addr=spi_addr + 0x1000,
+        load_addr=0,
+        executable=False,
+    )
+    fd_failover = tt_boot_fs.FsEntry(
+        tag="failover",
+        data=image_a,
+        spi_addr=spi_addr + 0x2000,
+        load_addr=0x1000000,
+        executable=False,
+        provisioning_only=False,
+    )
+    fs = fd_a.descriptor() + fd_b.descriptor()
+    fs += b"\xff" * (tt_boot_fs.FAILOVER_HEAD_ADDR - len(fs))
+    fs += fd_failover.descriptor()
+    fs += b"\xff" * (tt_boot_fs.SPI_RX_ADDR - len(fs))
+    fs += tt_boot_fs.SPI_RX_VALUE.to_bytes(tt_boot_fs.SPI_RX_SIZE, "little")
+    fs += image_a + b"\xff" * (0x1000 - len(image_a))
+    fs += image_b + b"\xff" * (0x1000 - len(image_b))
+    fs += image_a + b"\xff" * (0x1000 - len(image_a))
+    return fs
+
+
+def _gen_local_compare_bundle(workdir: Path) -> tuple[Path, Path, bytes]:
+    """
+    Build a minimal local fwbundle and matching flash image for compare tests.
+    Returns (bundle_path, flash_path, image_bytes) for board P150A-1.
+    """
+    image_a = b"\x73\x73\x42\x42"
+    image_b = b"\x73\x73\x42\x42\x37\x37\x24\x24"
+    fs = _build_minimal_bootfs(image_a, image_b)
+    bootfs_path = workdir / "test_bootfs.bin"
+    bootfs_path.write_bytes(fs)
+
+    other_bootfs_path = workdir / "other_bootfs.bin"
+    other_fs = _build_minimal_bootfs(
+        b"\x73\x73\x43\x43", b"\x73\x73\x43\x43\x37\x37\x25\x25"
+    )
+    other_bootfs_path.write_bytes(other_fs)
+
+    bundle_path = workdir / "local-test.fwbundle"
+    tt_fwbundle.create_fw_bundle(
+        bundle_path,
+        [19, 1, 0, 0],
+        {"P150A-1": bootfs_path, "P150B-1": other_bootfs_path},
+    )
+    flash_path = workdir / "flash.bin"
+    flash_path.write_bytes(fs)
+    return bundle_path, flash_path, fs
+
+
 def download_fwbundle(out: Path, url: str):
     """
     Download a firmware bundle from a URL to the specified output path.
@@ -421,3 +488,40 @@ def test_combine_fwbundle(workdir: Path):
     # Not much else we can check here, this isn't really a logical combination
     # of bundles. Just verify the output exists.
     assert combined_fwbundle_path.exists(), "Combined firmware bundle does not exist"
+
+
+def test_compare_flash_to_bundle_self_match(workdir: Path):
+    """
+    Validate that a bundle board image matches itself when compared via compare.
+    """
+    bundle_path, flash_path, _ = _gen_local_compare_bundle(workdir)
+    assert (
+        tt_fwbundle.compare_flash_to_bundle(flash_path, bundle_path, "P150A-1")
+        == os.EX_OK
+    ), "compare_flash_to_bundle should match identical flash and bundle image"
+
+
+def test_compare_flash_to_bundle_corrupt(workdir: Path):
+    """
+    Validate that compare detects a corrupted flash dump.
+    """
+    bundle_path, _, image = _gen_local_compare_bundle(workdir)
+    corrupt_path = workdir / "flash_corrupt.bin"
+    corrupted = bytearray(image)
+    corrupted[tt_boot_fs.IMAGE_ADDR] ^= 0xFF
+    corrupt_path.write_bytes(bytes(corrupted))
+    assert (
+        tt_fwbundle.compare_flash_to_bundle(corrupt_path, bundle_path, "P150A-1")
+        != os.EX_OK
+    ), "compare_flash_to_bundle should detect corruption"
+
+
+def test_compare_flash_to_bundle_wrong_board(workdir: Path):
+    """
+    Validate that compare fails when the board prefix does not match the flash image.
+    """
+    bundle_path, flash_path, _ = _gen_local_compare_bundle(workdir)
+    assert (
+        tt_fwbundle.compare_flash_to_bundle(flash_path, bundle_path, "P150B-1")
+        != os.EX_OK
+    ), "compare_flash_to_bundle should fail for wrong board"
