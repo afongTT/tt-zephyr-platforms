@@ -36,13 +36,28 @@ jobs:
         shell: bash
         run: |
           # Filter to only Blackhole boards (product == "bh"), then remove the product field
-          # Exclude galaxy and loudbox since they have no STLink/recovery path for smoke tests
-          MATRIX_CONFIG_BH="$(jq -c '[.[] | select((.product == "bh") and (.board != "galaxy") and (.board != "loudbox")) | del(.product)]' .github/ci_boards.json)"
+          # Exclude galaxy, loudbox, and quietbox2 since they have no STLink/recovery path for smoke tests
+          MATRIX_CONFIG_BH="$(jq -c '[.[] | select((.product == "bh") and (.board != "galaxy") and (.board != "loudbox") and (.board != "quietbox2")) | del(.product)]' .github/ci_boards.json)"
           echo "matrix-config-bh=$MATRIX_CONFIG_BH" | tee -a $GITHUB_OUTPUT
 
           # Filter to only Wormhole boards (product == "wh"), then remove the product field
           MATRIX_CONFIG_WH="$(jq -c '[.[] | select(.product == "wh") | del(.product)]' .github/ci_boards.json)"
           echo "matrix-config-wh=$MATRIX_CONFIG_WH" | tee -a $GITHUB_OUTPUT
+
+  detect-changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    outputs:
+      wh-blob-changed: ${{ steps.changes.outputs.wh-blob }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        id: changes
+        with:
+          filters: |
+            wh-blob:
+              - 'zephyr/blobs/fw_pack-wormhole.tar.gz'
 
   hardware-smoke-test:
     name: BH Hardware Smoke Test on ${{ matrix.config.board }}
@@ -56,7 +71,7 @@ jobs:
         config: ${{ fromJson(needs.gen-config.outputs.matrix-config-bh) }}
     runs-on: ${{ matrix.config.runs-on }}
     container:
-      image: ghcr.io/tenstorrent/tt-zephyr-platforms/ci-image:v18.12.0-rc1
+      image: ghcr.io/jgrowdentt/tt-system-firmware/ci-image:zephyr-4.4
       volumes:
         - /dev/hugepages-1G:/dev/hugepages-1G
         - /opt/tenstorrent/kmd-builds/:/opt/tenstorrent/kmd-builds/
@@ -147,7 +162,7 @@ jobs:
         config: ${{ fromJson(needs.gen-config.outputs.matrix-config-bh) }}
     runs-on: ${{ matrix.config.runs-on }}
     container:
-      image: ghcr.io/tenstorrent/tt-zephyr-platforms/ci-image:v18.12.0-rc1
+      image: ghcr.io/jgrowdentt/tt-system-firmware/ci-image:zephyr-4.4
       volumes:
         - /dev/hugepages-1G:/dev/hugepages-1G
         - /opt/tenstorrent/kmd-builds/:/opt/tenstorrent/kmd-builds/
@@ -189,6 +204,34 @@ jobs:
           fi
           echo "SIGNATURE_KEY_FILE=$SIGNATURE_KEY_FILE" >> "$GITHUB_ENV"
 
+      # Build bh-mod to be used by ccfgovr tests
+      - name: Build bh-mod
+        shell: bash
+        env:
+          LUWEN_REPO: ${{ vars.LUWEN_REPO || 'https://github.com/tenstorrent/luwen.git' }}
+          LUWEN_REF: ${{ vars.LUWEN_REF || 'main' }}
+        run: |
+          set -euo pipefail
+          missing=()
+          command -v protoc >/dev/null 2>&1 || missing+=(protobuf-compiler)
+          command -v curl   >/dev/null 2>&1 || missing+=(curl ca-certificates)
+          if [ ${#missing[@]} -gt 0 ]; then
+            apt-get update && apt-get install -y --no-install-recommends "${missing[@]}"
+          fi
+          protoc --version
+          # Ensure a Rust toolchain is available
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo --version
+          rm -rf "$HOME/luwen"
+          git clone --depth 1 --branch "$LUWEN_REF" "$LUWEN_REPO" "$HOME/luwen"
+          cargo build --release -p bh-mod --manifest-path "$HOME/luwen/Cargo.toml"
+          install -m 0755 "$HOME/luwen/target/release/bh-mod" /usr/local/bin/bh-mod
+          bh-mod --help
+
       - name: run-e2e-tests
         run: |
           tt-system-firmware/scripts/ci/run-e2e.sh -k $SIGNATURE_KEY_FILE \
@@ -226,15 +269,15 @@ jobs:
 
   smoke-e2e-wh-test:
     name: WH Smoke E2E Test on ${{ matrix.config.board }}
-    needs: [gen-config]
-    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'wh-tests')
+    needs: [gen-config, detect-changes]
+    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'wh-tests') || needs.detect-changes.outputs.wh-blob-changed == 'true'
     strategy:
       fail-fast: false
       matrix:
         config: ${{ fromJson(needs.gen-config.outputs.matrix-config-wh) }}
     runs-on: ${{ matrix.config.runs-on }}
     container:
-      image: ghcr.io/tenstorrent/tt-zephyr-platforms/ci-image:v18.12.0-rc1
+      image: ghcr.io/jgrowdentt/tt-system-firmware/ci-image:zephyr-4.4
       volumes:
         - /dev/hugepages-1G:/dev/hugepages-1G
         - /opt/tenstorrent/kmd-builds/:/opt/tenstorrent/kmd-builds/

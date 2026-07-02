@@ -5,6 +5,7 @@
 
 import logging
 import os
+import shutil
 import subprocess
 import re
 import sys
@@ -73,7 +74,7 @@ SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _skip_boards(board_name) -> bool:
-    return board_name == "loudbox" or "galaxy" in board_name.lower()
+    return board_name in ("loudbox", "quietbox2") or "galaxy" in board_name.lower()
 
 
 REFCLK_HZ = 50_000_000
@@ -82,11 +83,16 @@ REFCLK_HZ = 50_000_000
 ARC_STATUS = 0x80030060
 ARC_MISC_CTRL = 0x80030100
 BOOT_STATUS = 0x80030408
+ERROR_STATUS0 = 0x80030410
 PCIE_INIT_CPL_TIME_REG_ADDR = 0x80030438
 CMFW_START_TIME_REG_ADDR = 0x8003043C
 ARC_START_TIME_REG_ADDR = 0x80030440
 ARC_HANG_PC_REG_ADDR = 0x80030454
 TELEMETRY_DATA_REG_ADDR = 0x80030430
+
+# ETH tile registers
+# Using this as a scratch register to verify ETH tile reset
+TRISC0_RESET_PC_ADDR = 0xFFB12228
 
 # ARC messages
 TT_SMC_MSG_REINIT_TENSIX = 0x20
@@ -105,6 +111,10 @@ TT_SMC_MSG_SET_ASIC_HOST_FMAX = 0x23
 TT_SMC_MSG_CHARACTERISATION = 0xC6
 TT_SMC_MSG_COUNTER = 0x35
 TT_SMC_MSG_TOGGLE_GDDR_RESET = 0xB6
+TT_SMC_MSG_TOGGLE_ETH_RESET = 0xB0
+
+# ETH toggle reset (eth_tile_reset_rqst) — response[1] uses eth_reset_err from ARC
+ETH_RESET_ERR_INVALID_MASK = 1
 
 # Characterization submessage IDs
 TT_SUB_MSG_SET_HOST_REQUESTED_FMIN = 0x1
@@ -121,6 +131,8 @@ TAG_HOST_AICLK_LIMIT = 70
 NUM_PD = 16
 NUM_VM = 8
 NUM_TS = 8
+
+NUM_ETH = 14
 
 
 def read_telem(arc_chip, telem_idx):
@@ -217,6 +229,8 @@ def check_chip_count(board_name):
         assert len(chips) == 32, f"Expected 32 BH chips on Galaxy, found {len(chips)}"
     elif "loudbox" in board_name:
         assert len(chips) == 8, f"Expected 8 BH chips on Loudbox, found {len(chips)}"
+    elif "quietbox2" in board_name:
+        assert len(chips) == 4, f"Expected 4 BH chips on Quietbox2, found {len(chips)}"
     elif "p300" in board_name:
         assert len(chips) == 2, f"Expected 2 BH chips on P300, found {len(chips)}"
     else:
@@ -521,11 +535,12 @@ def test_boot_status(arc_chip_dut, asic_id):
     """
     Validates the boot status of the ARC firmware
     """
-    # Read the boot status register and validate that it is correct
     arc_chip = pyluwen.detect_chips()[asic_id]
     status = arc_chip.axi_read32(BOOT_STATUS)
+    err = arc_chip.axi_read32(ERROR_STATUS0)
+
     assert (status >> 1) & 0x3 == 0x2, "SMC HW boot status is not valid"
-    logger.info('SMC boot status "%d"', status)
+    assert err == 0, "FW Init error"
 
 
 def test_smbus_status(arc_chip_dut, asic_id):
@@ -876,8 +891,8 @@ def dirty_reset_test():
 
 
 @pytest.mark.skipif(
-    "os.getenv('BOARD') in ('galaxy', 'loudbox')",
-    reason="Galaxy: no DMC path; Loudbox: no STLink for OpenOCD dirty reset",
+    "os.getenv('BOARD') in ('galaxy', 'loudbox', 'quietbox2')",
+    reason="Galaxy: no DMC path; Loudbox/Quietbox2: no STLink for OpenOCD dirty reset",
 )
 def test_dirty_reset():
     """
@@ -1190,7 +1205,7 @@ def power_state_toggle_test(arc_chip_dut, asic_id, board_name):
 
     Toggles between high and low power states and verifies that the TDP
     difference between the two states is greater than 80W.
-    For galaxy and loudbox, only tests power state setting without TDP validation.
+    For galaxy, loudbox, and quietbox2, only tests power state setting without TDP validation.
     """
     expected_power_delta = 80
     settling_time = 0.5
@@ -1234,7 +1249,7 @@ def power_state_toggle_test(arc_chip_dut, asic_id, board_name):
 def test_power_state_toggle(arc_chip_dut, asic_id, board_name):
     """
     Validates that toggling between high and low power states results in a TDP delta > 90W
-    For galaxy and loudbox, only validates power state setting functionality.
+    For galaxy, loudbox, and quietbox2, only validates power state setting functionality.
     """
     assert 0 == power_state_toggle_test(arc_chip_dut, asic_id, board_name), (
         "power_state_toggle_test failed"
@@ -1245,25 +1260,174 @@ def test_eth_live_status(arc_chip_dut, asic_id):
     """
     Validates that the Ethernet live status reflects correct heartbeat status.
 
-    Reads TAG_ETH_LIVE_STATUS from telemetry and checks that the heartbeat
-    bitmask (lower 16 bits) matches the enabled ETH bitmask (TAG_ENABLED_ETH),
-    since every enabled ETH tile should be posting a heartbeat.
+    Polls TAG_ETH_LIVE_STATUS every second until the heartbeat bitmask (lower 16
+    bits) matches TAG_ENABLED_ETH. Fails if the condition is not met within 75 s.
     """
+    # ETH FW can take up to 60 seconds to start its heartbeat.
+    # How long we actually have to wait depends on the board type and
+    # how long it has been since the ASIC was reset.
+    # Running this test before eth_toggle_reset_* tests reduces the amount of waiting time.
+    TIMEOUT_S = 75.0
+    POLL_INTERVAL_S = 1.0
+
     arc_chip = pyluwen.detect_chips()[asic_id]
-
-    eth_live_status = read_telem(arc_chip, TAG_ETH_LIVE_STATUS)
     eth_enabled = read_telem(arc_chip, TAG_ENABLED_ETH)
+    start = time.monotonic()
 
-    heartbeat_status = eth_live_status & 0xFFFF
+    while True:
+        elapsed = time.monotonic() - start
+        eth_live_status = read_telem(arc_chip, TAG_ETH_LIVE_STATUS)
+        heartbeat_status = eth_live_status & 0xFFFF
 
-    logger.info(
-        f"ETH enabled: {eth_enabled:#06x}, heartbeat status: {heartbeat_status:#06x}"
+        logger.debug(
+            f"[{elapsed:.1f}s] ETH enabled: {eth_enabled:#06x}, "
+            f"heartbeat status: {heartbeat_status:#06x}"
+        )
+
+        if heartbeat_status == eth_enabled:
+            logger.info(
+                f"Heartbeat matched eth_enabled after {elapsed:.1f}s "
+                f"({heartbeat_status:#06x})"
+            )
+            return
+
+        if elapsed >= TIMEOUT_S:
+            pytest.fail(
+                f"Heartbeat status {heartbeat_status:#06x} did not match "
+                f"eth_enabled {eth_enabled:#06x} within {TIMEOUT_S:.0f}s"
+            )
+
+        time.sleep(POLL_INTERVAL_S)
+
+
+def send_eth_toggle_reset(arc_chip, eth_inst_mask, no_fw_reload=False, timeout=None):
+    """Send TT_SMC_MSG_TOGGLE_ETH_RESET (eth_tile_reset_rqst).
+
+    eth_inst_mask: bit N selects ETH instance N.
+    no_fw_reload: when True, sets data[2] bit 0 to skip SPI FW reload and ReleaseEthReset.
+    """
+    msg = [
+        TT_SMC_MSG_TOGGLE_ETH_RESET,
+        eth_inst_mask,
+        1 if no_fw_reload else 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
+    if timeout is not None:
+        return arc_chip.as_bh().arc_msg_buf(msg, timeout=timeout)
+    return arc_chip.as_bh().arc_msg_buf(msg)
+
+
+def eth_id_to_noc0_coords(eth_inst) -> tuple[int, int]:
+    PHYS_X_TO_NOC0 = [0, 1, 16, 2, 15, 3, 14, 4, 13, 5, 12, 6, 11, 7, 10, 8, 9]
+
+    x = PHYS_X_TO_NOC0[eth_inst + 1]
+    y = 1  # All ETH tiles are on the same row
+
+    return x, y
+
+
+def set_eth_scratch_pre_reset(arc_chip, eth_inst_mask):
+    """
+    Write a sentinel value to the scratch register for the given ETH instances.
+    This is used to verify that the ETH tile was reset.
+    Avoid writing to harvested ETH tiles, since that will hang the NOC.
+    """
+    for eth_inst in range(NUM_ETH):
+        if not (1 << eth_inst) & eth_inst_mask:
+            continue
+
+        x, y = eth_id_to_noc0_coords(eth_inst)
+        arc_chip.noc_write32(
+            noc_id=0, x=x, y=y, addr=TRISC0_RESET_PC_ADDR, data=0xA5A5A5A5
+        )
+
+
+def check_eth_scratch_post_reset(arc_chip, eth_inst_mask):
+    """
+    Verify that the scratch register for the given ETH instances was cleared after reset.
+    Avoid reading from harvested ETH tiles, since that will hang the NOC.
+    """
+    for eth_inst in range(NUM_ETH):
+        if not (1 << eth_inst) & eth_inst_mask:
+            continue
+
+        x, y = eth_id_to_noc0_coords(eth_inst)
+        scratch = arc_chip.noc_read32(noc_id=0, x=x, y=y, addr=TRISC0_RESET_PC_ADDR)
+        assert scratch == 0, f"ETH {eth_inst} scratch register not cleared after reset"
+
+
+def test_eth_toggle_reset_invalid_mask(arc_chip_dut, asic_id):
+    """Reject ETH reset bitmask with bits outside the supported instance range."""
+    arc_chip = pyluwen.detect_chips()[asic_id]
+    bad_mask = 1 << 15
+    response = send_eth_toggle_reset(arc_chip, bad_mask)
+    assert response[0] != 0, "expected non-zero exit for invalid ETH instance mask"
+    assert response[1] == ETH_RESET_ERR_INVALID_MASK, (
+        f"expected ETH_RESET_ERR_INVALID_MASK ({ETH_RESET_ERR_INVALID_MASK}), got {response[1]}"
     )
 
-    assert heartbeat_status == eth_enabled, (
-        f"Heartbeat status {heartbeat_status:#06x} does not match "
-        f"eth_enabled {eth_enabled:#06x}"
+
+def test_eth_toggle_reset_noop_mask(arc_chip_dut, asic_id):
+    """Zero bitmask is a no-op and must return success."""
+    arc_chip = pyluwen.detect_chips()[asic_id]
+    response = send_eth_toggle_reset(arc_chip, 0)
+    assert response[0] == 0, (
+        f"expected success, got status={response[0]} detail={response[1]}"
     )
+    assert response[1] == 0
+
+
+def test_eth_toggle_reset_individual(arc_chip_dut, asic_id):
+    """Reset all individual ETH instances."""
+    arc_chip = pyluwen.detect_chips()[asic_id]
+    eth_enabled = arc_chip.get_telemetry().enabled_eth
+
+    logger.info("Individually reset each ETH instance without SPI FW reload")
+    for eth_inst in range(NUM_ETH):
+        set_eth_scratch_pre_reset(arc_chip, (1 << eth_inst) & eth_enabled)
+        response = send_eth_toggle_reset(arc_chip, 1 << eth_inst, no_fw_reload=True)
+        assert response[0] == 0, (
+            f"ETH {eth_inst}: expected success, got status={response[0]} detail={response[1]}"
+        )
+        assert response[1] == (1 << eth_inst) & eth_enabled
+        check_eth_scratch_post_reset(arc_chip, (1 << eth_inst) & eth_enabled)
+
+    logger.info("Individually reset each ETH instance with SPI FW reload")
+    for eth_inst in range(NUM_ETH):
+        set_eth_scratch_pre_reset(arc_chip, (1 << eth_inst) & eth_enabled)
+        response = send_eth_toggle_reset(arc_chip, 1 << eth_inst)
+        assert response[0] == 0, (
+            f"ETH {eth_inst}: expected success, got status={response[0]} detail={response[1]}"
+        )
+        assert response[1] == (1 << eth_inst) & eth_enabled
+        check_eth_scratch_post_reset(arc_chip, (1 << eth_inst) & eth_enabled)
+
+
+def test_eth_toggle_reset_all(arc_chip_dut, asic_id):
+    """Reset all ETH instances"""
+    arc_chip = pyluwen.detect_chips()[asic_id]
+    eth_enabled = arc_chip.get_telemetry().enabled_eth
+    logger.info("Reset all ETH instances without SPI FW reload")
+    set_eth_scratch_pre_reset(arc_chip, ((1 << NUM_ETH) - 1) & eth_enabled)
+    response = send_eth_toggle_reset(arc_chip, (1 << NUM_ETH) - 1, no_fw_reload=True)
+    assert response[0] == 0, (
+        f"expected success, got status={response[0]} detail={response[1]}"
+    )
+    assert response[1] == eth_enabled
+    check_eth_scratch_post_reset(arc_chip, ((1 << NUM_ETH) - 1) & eth_enabled)
+
+    logger.info("Reset all ETH instances with SPI FW reload")
+    set_eth_scratch_pre_reset(arc_chip, ((1 << NUM_ETH) - 1) & eth_enabled)
+    response = send_eth_toggle_reset(arc_chip, (1 << NUM_ETH) - 1)
+    assert response[0] == 0, (
+        f"expected success, got status={response[0]} detail={response[1]}"
+    )
+    assert response[1] == eth_enabled
+    check_eth_scratch_post_reset(arc_chip, ((1 << NUM_ETH) - 1) & eth_enabled)
 
 
 def test_gddr_reset(arc_chip_dut, asic_id):
@@ -1548,3 +1712,48 @@ def test_bindesc(arc_chip_dut, asic_id):
         f"Bindesc version mismatch: 0x{bindesc_version:08x} != expected 0x{smc_version:08x}"
     )
     logger.info(f"Bindesc version: 0x{bindesc_version:08x}")
+
+
+def test_ccfgovr_bh_mod(unlaunched_dut: DeviceAdapter, asic_id: int):
+    """
+    Test bh-mod can correctly set TDP limit, and that it is not overriden
+    by tt-flash.
+    """
+    bh_mod = shutil.which("bh-mod") or os.path.expanduser("~/bh-mod")
+    if not os.path.isfile(bh_mod):
+        pytest.skip("bh-mod not found (PATH or ~/bh-mod)")
+
+    # Get the TDP limit
+    chip = pyluwen.detect_chips()[asic_id]
+    baseline = chip.get_telemetry().tdp_limit_max
+    target = baseline - 5
+
+    # Set new TDP limit
+    result = subprocess.run(
+        [bh_mod, "--reset-timeout=60s", "set", f"chip_limits.tdp_limit={target}"],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"bh-mod set failed, rc={result.returncode}"
+
+    # Verify TDP limit has been set correctly by bh-mod
+    chip = pyluwen.detect_chips()[asic_id]
+    measured = chip.get_telemetry().tdp_limit_max
+    assert measured == target, f"expected tdp_limit_max={target}, got {measured}"
+
+    # Re-flash the firmware bundle and confirm the override survives.
+    unlaunched_dut.launch()
+    del chip  # force re-detection after the flash and reboot
+    chip = wait_arc_boot(asic_id, timeout=60)
+    measured_after_flash = chip.get_telemetry().tdp_limit_max
+    assert measured_after_flash == target, (
+        f"ccfgovr did not survive tt-flash: "
+        f"expected tdp_limit_max={target}, got {measured_after_flash}"
+    )
+
+    # Revert TDP limit back to original
+    subprocess.run(
+        [bh_mod, "set", f"chip_limits.tdp_limit={baseline}"],
+        capture_output=True,
+        check=False,
+    )
