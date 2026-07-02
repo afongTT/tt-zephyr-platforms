@@ -115,6 +115,7 @@ typedef union {
 
 #define PCIE_SII_LTSSM_STATE_REG_DEFAULT (0x00000000)
 
+static const struct device *gpio0 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(gpio0));
 static const struct device *gpio3 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(gpio3));
 
 static inline void WritePcieTlbConfigReg(const uint32_t addr, const uint32_t data)
@@ -374,6 +375,7 @@ static PCIeInitStatus PCIeInitComm(const struct CntlInitV2Param *param)
 
 	SetupDbiAccess();
 	CntlInitV2(param);
+	gpio_pin_configure(gpio0, 10, GPIO_OUTPUT_HIGH);
 
 	SetupSii();
 	SetupOutboundTlbs(); /* pcie_inst is implied by ConfigurePCIeTlbs */
